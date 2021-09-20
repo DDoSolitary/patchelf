@@ -210,6 +210,8 @@ public:
 
     void clearSymbolVersions(const std::set<std::string> & syms);
 
+    void unhideGlobalSymbols();
+
 private:
 
     /* Convert an integer in big or little endian representation (as
@@ -1793,6 +1795,26 @@ void ElfFile<ElfFileParamNames>::clearSymbolVersions(const std::set<std::string>
     changed = true;
 }
 
+template<ElfFileParams>
+void ElfFile<ElfFileParamNames>::unhideGlobalSymbols()
+{
+    auto shdrSymTab = findSection(".symtab");
+    auto syms = (Elf_Sym *)(fileContents->data() + rdi(shdrSymTab.sh_offset));
+    size_t count = rdi(shdrSymTab.sh_size) / sizeof(Elf_Sym);
+
+    for (size_t i = 0; i < count; i++) {
+        auto sym = &syms[i];
+        auto info = rdi(sym->st_info);
+        // FIXME: ELF32_* and ELF64_* variants should be used respectively, though they are defined to the same thing.
+        auto info_bind = ELF64_ST_BIND(info);
+        auto info_type = ELF64_ST_TYPE(info);
+        if (info_bind == STB_GLOBAL && (info_type == STT_OBJECT || info_type == STT_FUNC) && rdi(sym->st_other) == STV_HIDDEN) {
+            wri(sym->st_other, STV_DEFAULT);
+        }
+    }
+    changed = true;
+}
+
 static bool printInterpreter = false;
 static bool printSoname = false;
 static bool setSoname = false;
@@ -1809,6 +1831,7 @@ static std::set<std::string> neededLibsToRemove;
 static std::map<std::string, std::string> neededLibsToReplace;
 static std::set<std::string> neededLibsToAdd;
 static std::set<std::string> symbolsToClearVersion;
+static bool unhideGlobalSymbols = false;
 static bool printNeeded = false;
 static bool noDefaultLib = false;
 
@@ -1845,6 +1868,9 @@ static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, con
     elfFile.replaceNeeded(neededLibsToReplace);
     elfFile.addNeeded(neededLibsToAdd);
     elfFile.clearSymbolVersions(symbolsToClearVersion);
+
+    if(unhideGlobalSymbols)
+        elfFile.unhideGlobalSymbols();
 
     if (noDefaultLib)
         elfFile.noDefaultLib();
@@ -1906,6 +1932,7 @@ void showHelp(const std::string & progName)
   [--print-needed]\n\
   [--no-default-lib]\n\
   [--clear-symbol-version SYMBOL]\n\
+  [--unhide-global-symbols]\n\
   [--output FILE]\n\
   [--debug]\n\
   [--version]\n\
@@ -2002,6 +2029,9 @@ int mainWrapped(int argc, char * * argv)
         else if (arg == "--clear-symbol-version") {
             if (++i == argc) error("missing argument");
             symbolsToClearVersion.insert(resolveArgument(argv[i]));
+        }
+        else if (arg == "--unhide-global-symbols") {
+            unhideGlobalSymbols = true;
         }
         else if (arg == "--output") {
             if (++i == argc) error("missing argument");
