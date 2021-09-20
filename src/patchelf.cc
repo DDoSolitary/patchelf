@@ -388,7 +388,7 @@ ElfFile<ElfFileParamNames>::ElfFile(FileContents fContents)
 
     littleEndian = hdr()->e_ident[EI_DATA] == ELFDATA2LSB;
 
-    if (rdi(hdr()->e_type) != ET_EXEC && rdi(hdr()->e_type) != ET_DYN)
+    if (rdi(hdr()->e_type) != ET_EXEC && rdi(hdr()->e_type) != ET_DYN && rdi(hdr()->e_type) != ET_REL)
         error("wrong ELF type");
 
     if (rdi(hdr()->e_phoff) + rdi(hdr()->e_phnum) * rdi(hdr()->e_phentsize) > fileContents->size())
@@ -400,7 +400,7 @@ ElfFile<ElfFileParamNames>::ElfFile(FileContents fContents)
     if (rdi(hdr()->e_shoff) + rdi(hdr()->e_shnum) * rdi(hdr()->e_shentsize) > fileContents->size())
         error("section header table out of bounds");
 
-    if (rdi(hdr()->e_phentsize) != sizeof(Elf_Phdr))
+    if (rdi(hdr()->e_phentsize) != sizeof(Elf_Phdr) && rdi(hdr()->e_phentsize) != 0)
         error("program headers have wrong size");
 
     /* Copy the program and section headers. */
