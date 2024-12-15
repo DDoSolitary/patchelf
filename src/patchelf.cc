@@ -59,6 +59,7 @@ static bool debugMode = false;
 
 static bool forceRPath = false;
 static bool clobberOldSections = true;
+static bool rebuildShdrs = false;
 
 static std::vector<std::string> fileNames;
 static std::string outputFileName;
@@ -294,10 +295,9 @@ ElfFile<ElfFileParamNames>::ElfFile(FileContents fContents)
         }
     }
 
-    if (rdi(hdr()->e_shnum) == 0)
+    if (rdi(hdr()->e_shnum) == 0 && !rebuildShdrs) {
         error("no section headers. The input file is probably a statically linked, self-decompressing binary");
-
-    {
+    } else {
         auto sh_offset = rdi(hdr()->e_shoff);
         auto sh_num = rdi(hdr()->e_shnum);
         auto sh_entsize = rdi(hdr()->e_shentsize);
@@ -322,38 +322,42 @@ ElfFile<ElfFileParamNames>::ElfFile(FileContents fContents)
         if (rdi(phdrs[i].p_type) == PT_INTERP) isExecutable = true;
     }
 
-    for (int i = 0; i < rdi(hdr()->e_shnum); ++i) {
-        Elf_Shdr *shdr = (Elf_Shdr *) (fileContents->data() + rdi(hdr()->e_shoff)) + i;
+    if (rebuildShdrs) {
+        rebuildSectionHeaders();
+    } else {
+        for (int i = 0; i < rdi(hdr()->e_shnum); ++i) {
+            Elf_Shdr *shdr = (Elf_Shdr *) (fileContents->data() + rdi(hdr()->e_shoff)) + i;
 
-        checkPointer(fileContents, shdr, sizeof(*shdr));
-        shdrs.push_back(*shdr);
+            checkPointer(fileContents, shdr, sizeof(*shdr));
+            shdrs.push_back(*shdr);
+        }
+
+        /* Get the section header string table section (".shstrtab").  Its
+           index in the section header table is given by e_shstrndx field
+           of the ELF header. */
+        auto shstrtabIndex = rdi(hdr()->e_shstrndx);
+        if (shstrtabIndex >= shdrs.size())
+            error("string table index out of bounds");
+
+        auto shstrtabSize = rdi(shdrs[shstrtabIndex].sh_size);
+        size_t shstrtabptr;
+        if (__builtin_add_overflow(reinterpret_cast<size_t>(fileContents->data()), rdi(shdrs[shstrtabIndex].sh_offset), &shstrtabptr))
+            error("string table overflow");
+        const char *shstrtab = reinterpret_cast<const char *>(shstrtabptr);
+        checkPointer(fileContents, shstrtab, shstrtabSize);
+
+        if (shstrtabSize == 0)
+            error("string table size is zero");
+
+        if (shstrtab[shstrtabSize - 1] != 0)
+            error("string table is not zero terminated");
+
+        sectionNames = std::string(shstrtab, shstrtabSize);
+
+        sectionsByOldIndex.resize(shdrs.size());
+        for (size_t i = 1; i < shdrs.size(); ++i)
+            sectionsByOldIndex.at(i) = getSectionName(shdrs.at(i));
     }
-
-    /* Get the section header string table section (".shstrtab").  Its
-       index in the section header table is given by e_shstrndx field
-       of the ELF header. */
-    auto shstrtabIndex = rdi(hdr()->e_shstrndx);
-    if (shstrtabIndex >= shdrs.size())
-        error("string table index out of bounds");
-
-    auto shstrtabSize = rdi(shdrs[shstrtabIndex].sh_size);
-    size_t shstrtabptr;
-    if (__builtin_add_overflow(reinterpret_cast<size_t>(fileContents->data()), rdi(shdrs[shstrtabIndex].sh_offset), &shstrtabptr))
-        error("string table overflow");
-    const char *shstrtab = reinterpret_cast<const char *>(shstrtabptr);
-    checkPointer(fileContents, shstrtab, shstrtabSize);
-
-    if (shstrtabSize == 0)
-        error("string table size is zero");
-
-    if (shstrtab[shstrtabSize - 1] != 0)
-        error("string table is not zero terminated");
-
-    sectionNames = std::string(shstrtab, shstrtabSize);
-
-    sectionsByOldIndex.resize(shdrs.size());
-    for (size_t i = 1; i < shdrs.size(); ++i)
-        sectionsByOldIndex.at(i) = getSectionName(shdrs.at(i));
 }
 
 
@@ -1300,6 +1304,400 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
     }
 }
 
+
+template<ElfFileParams>
+size_t ElfFile<ElfFileParamNames>::addSectionHeaderFromPhdr(const std::string & name, const Elf_Phdr & phdr, decltype(Elf_Shdr::sh_type) type, decltype(Elf_Shdr::sh_flags) flags)
+{
+    Elf_Shdr shdr = {};
+    wri(shdr.sh_name, sectionNames.size());
+    /* Include the trailing null terminator. */
+    sectionNames.append(name.c_str(), name.size() + 1);
+    wri(shdr.sh_type, type);
+    wri(shdr.sh_flags, flags);
+    wri(shdr.sh_addr, rdi(phdr.p_vaddr));
+    wri(shdr.sh_offset, rdi(phdr.p_offset));
+    wri(shdr.sh_size, rdi(phdr.p_filesz));
+    wri(shdr.sh_addralign, rdi(phdr.p_align));
+    auto ndx = shdrs.size();
+    shdrs.push_back(shdr);
+    return ndx;
+}
+
+
+template<ElfFileParams>
+size_t ElfFile<ElfFileParamNames>::addSectionHeaderFromDynTag(const std::string & name, const Elf_Dyn & dyn, decltype(Elf_Shdr::sh_type) type, decltype(Elf_Shdr::sh_flags) flags)
+{
+    Elf_Shdr shdr = {};
+    wri(shdr.sh_name, sectionNames.size());
+    /* Include the trailing null terminator. */
+    sectionNames.append(name.c_str(), name.size() + 1);
+    wri(shdr.sh_type, type);
+    wri(shdr.sh_flags, flags);
+    auto vaddr = rdi(dyn.d_un.d_ptr);
+    wri(shdr.sh_addr, vaddr);
+    /* Dynamic tags only contain virtual addresses, but we also need file
+       offsets for sh_offset. */
+    for (auto & phdr : phdrs) {
+        if (vaddr >= rdi(phdr.p_vaddr) && vaddr <= rdi(phdr.p_vaddr) + rdi(phdr.p_memsz)) {
+            wri(shdr.sh_offset, vaddr - rdi(phdr.p_vaddr) + rdi(phdr.p_offset));
+        }
+    }
+    /* Default to no alignment requirement, and other fields are left unset.
+       The caller should update them if necessary */
+    wri(shdr.sh_addralign, 1);
+    auto ndx = shdrs.size();
+    shdrs.push_back(shdr);
+    return ndx;
+}
+
+
+template<ElfFileParams>
+void ElfFile<ElfFileParamNames>::rebuildSectionHeaders()
+{
+    /* rewriteSections will replace a few sections at the beginning of the file
+       to make room for new program headers. If there lies any undetected
+       section required at runtime then boom! */
+    fprintf(stderr, "warning: it is inherently impossible to rebuild all section headers, undetected sections may be overwritten, resulting in corrupt output files\n");
+
+    /* The first header is for SHN_UNDEF. */
+    shdrs.push_back(Elf_Shdr{});
+
+    /* Create a new string table for section headers. */
+    const char initSectionNames[] = "\0.shstrtab";
+    /* Trailing null terminator is included in sizeof. */
+    sectionNames = std::string(initSectionNames, sizeof(initSectionNames));
+    Elf_Shdr shdrShstrtab = {};
+    wri(shdrShstrtab.sh_name, 1);
+    wri(shdrShstrtab.sh_type, SHT_STRTAB);
+    wri(shdrShstrtab.sh_addralign, 1);
+    shdrs.push_back(shdrShstrtab);
+
+    /* Some sections can be recovered from program headers. */
+    auto shdrDynamicNdx = SHN_UNDEF;
+    for (auto & phdr : phdrs) {
+        if (rdi(phdr.p_type) == PT_DYNAMIC) {
+            shdrDynamicNdx = addSectionHeaderFromPhdr(".dynamic", phdr, SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE);
+            wri(shdrs[shdrDynamicNdx].sh_entsize, sizeof(Elf_Dyn));
+        } else if (rdi(phdr.p_type) == PT_INTERP) {
+            addSectionHeaderFromPhdr(".interp", phdr, SHT_PROGBITS, SHF_ALLOC);
+        } else if (rdi(phdr.p_type == PT_NOTE)) {
+            Elf_Off noteOffset = 0;
+            while (noteOffset < rdi(phdr.p_filesz)) {
+                auto nhdr = (Elf_Nhdr *)(fileContents->data() + rdi(phdr.p_offset) + noteOffset);
+                auto noteSize = sizeof(Elf_Nhdr) + roundUp(rdi(nhdr->n_namesz), 4) + roundUp(rdi(nhdr->n_descsz), 4);
+                auto noteName = (char *)(nhdr + 1);
+                const char *shdrName = ".note";
+                if (strncmp(noteName, ELF_NOTE_GNU, rdi(nhdr->n_namesz)) == 0) {
+                    if (nhdr->n_type == NT_GNU_PROPERTY_TYPE_0) {
+                        shdrName = ".note.gnu.property";
+                    } else if (rdi(nhdr->n_type) == NT_GNU_ABI_TAG) {
+                        shdrName = ".note.ABI-tag";
+                    } else if (rdi(nhdr->n_type) == NT_GNU_BUILD_ID) {
+                        shdrName = ".note.gnu.build-id";
+                    }
+                }
+                auto ndx = addSectionHeaderFromPhdr(shdrName, phdr, SHT_NOTE, SHF_ALLOC);
+                wri(shdrs[ndx].sh_addr, rdi(shdrs[ndx].sh_addr) + noteOffset);
+                wri(shdrs[ndx].sh_offset, rdi(shdrs[ndx].sh_offset) + noteOffset);
+                wri(shdrs[ndx].sh_size, noteSize);
+                noteOffset += noteSize;
+            }
+        } else if (rdi(phdr.p_type == PT_GNU_EH_FRAME)) {
+            /* It is theoretically possible to read the starting address of
+               .eh_frame from the header, but it requires parsing the DWARF
+               encoded pointer, and there is no way to get the size anyway. */
+            addSectionHeaderFromPhdr(".eh_frame_hdr", phdr, SHT_PROGBITS, SHF_ALLOC);
+        } else if (rdi(phdr.p_type == PT_MIPS_ABIFLAGS)) {
+            addSectionHeaderFromPhdr(".MIPS.abiflags", phdr, SHT_MIPS_ABIFLAGS, SHF_ALLOC);
+        } else if (rdi(phdr.p_type == PT_MIPS_REGINFO)) {
+            auto ndx = addSectionHeaderFromPhdr(".reginfo", phdr, SHT_MIPS_REGINFO, SHF_ALLOC);
+            wri(shdrs[ndx].sh_entsize, sizeof(Elf32_RegInfo));
+        }
+    }
+
+    /* Some other sections can be recovered from the dynamic section. */
+    if (shdrDynamicNdx == SHN_UNDEF) {
+        error("cannot find the PT_DYNAMIC segment");
+    }
+
+    /* Build a map from d_tag to Elf_Dyn for easy lookup. DT_NEEDED tags may
+       appear multiple times but they won't be read here. */
+    auto dyns = (Elf_Dyn *)(fileContents->data() + rdi(shdrs[shdrDynamicNdx].sh_offset));
+    std::unordered_map<decltype(DT_NULL), Elf_Dyn *> dynTags;
+    for (auto dyn = dyns; rdi(dyn->d_tag) != DT_NULL; dyn++) {
+        dynTags[rdi(dyn->d_tag)] = dyn;
+    }
+
+    if (dynTags.find(DT_STRTAB) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".dynstr", *dynTags[DT_STRTAB], SHT_STRTAB, SHF_ALLOC);
+        if (dynTags.find(DT_STRSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_STRSZ]->d_un.d_val));
+        }
+        wri(shdrs[shdrDynamicNdx].sh_link, ndx);
+    }
+
+    size_t shdrDynSymNdx = SHN_UNDEF;
+    if (dynTags.find(DT_SYMTAB) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".dynsym", *dynTags[DT_SYMTAB], SHT_DYNSYM, SHF_ALLOC);
+        wri(shdrs[ndx].sh_link, rdi(shdrs[shdrDynamicNdx].sh_link));
+        wri(shdrs[ndx].sh_addralign, alignof(Elf_Sym));
+        wri(shdrs[ndx].sh_entsize, sizeof(Elf_Sym));
+        if (dynTags.find(DT_SYMENT) != dynTags.end() && rdi(dynTags[DT_SYMENT]->d_un.d_val) != sizeof(Elf_Sym)) {
+            error("invalid value of DT_SYMENT");
+        }
+        shdrDynSymNdx = ndx;
+    }
+
+    if (dynTags.find(DT_HASH) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".hash", *dynTags[DT_HASH], SHT_HASH, SHF_ALLOC);
+        wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        wri(shdrs[ndx].sh_addralign, alignof(uint32_t));
+        wri(shdrs[ndx].sh_entsize, sizeof(uint32_t));
+
+        /* parse the hash table to get the size of itself and the .dynsym section */
+        auto hashHdr = (typename HashTable::Header*)(fileContents->data() + rdi(shdrs[ndx].sh_offset));
+        wri(shdrs[ndx].sh_size, sizeof(typename HashTable::Header) + (rdi(hashHdr->numBuckets) + rdi(hashHdr->nchain)) * sizeof(uint32_t));
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[shdrDynSymNdx].sh_size, rdi(hashHdr->nchain) * sizeof(Elf_Sym));
+        }
+    }
+
+    if (dynTags.find(DT_GNU_HASH) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".gnu.hash", *dynTags[DT_GNU_HASH], SHT_GNU_HASH, SHF_ALLOC);
+        wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        wri(shdrs[ndx].sh_addralign, std::max(alignof(uint32_t), alignof(typename GnuHashTable::BloomWord)));
+
+        /* Parse the hash table to get the size of itself and the .dynsym section. */
+        auto hashHdr = (typename GnuHashTable::Header*)(fileContents->data() + rdi(shdrs[ndx].sh_offset));
+        auto bloomFilters = span((typename GnuHashTable::BloomWord*)(hashHdr + 1), rdi(hashHdr->maskwords));
+        auto buckets = span((uint32_t*)bloomFilters.end(), rdi(hashHdr->numBuckets));
+        auto table = buckets.end();
+        auto max_bucket = std::max_element(buckets.begin(), buckets.end());
+        uint32_t table_size = 0;
+        if (max_bucket != buckets.end() && *max_bucket >= rdi(hashHdr->symndx)) {
+            auto i = *max_bucket - rdi(hashHdr->symndx);
+            while ((rdi(table[i]) & 1) == 0) {
+                i++;
+            }
+            table_size = i + 1;
+        }
+        wri(shdrs[ndx].sh_size, (char *)(table + table_size) - (char *)hashHdr);
+        /* Some ELF files have only one of DT_HASH and DT_GNU_HASH while others
+           have both. We have to try to parse both tables to get the size of
+           the symbol table. */
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[shdrDynSymNdx].sh_size, (table_size + rdi(hashHdr->symndx)) * sizeof(Elf_Sym));
+        }
+    }
+
+    /* Update sh_info and st_shndx for .dynsym as both .hash and .gnu.hash have
+       benn parsed and the size of the symbol table should be known by now */
+    if (shdrDynSymNdx != SHN_UNDEF) {
+        auto syms = (Elf_Sym *)(fileContents->data() + rdi(shdrs[shdrDynSymNdx].sh_offset));
+        for (size_t i = 0; i < rdi(shdrs[shdrDynSymNdx].sh_size) / sizeof(Elf_Sym); i++) {
+            if (ELF32_ST_BIND(rdi(syms[i].st_info)) == STB_LOCAL) {
+                wri(shdrs[shdrDynSymNdx].sh_info, i + 1);
+            }
+            auto oldNdx = rdi(syms[i].st_shndx);
+            /* Don't touch the reserved values */
+            if (oldNdx != SHN_UNDEF && (oldNdx < SHN_LORESERVE || oldNdx > SHN_HIRESERVE)) {
+                /* We know nothing about the original section headers, so it's
+                   impossible to set the correct value. However, the symbol
+                   values are already converted to virtual addresses during
+                   linking and non-reserved values of st_shndx no longer
+                   matter, so we just set them to an existing section to avoid
+                   warnings. */
+                wri(syms[i].st_shndx, 1);
+            }
+        }
+    }
+
+    if (dynTags.find(DT_VERSYM) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".gnu.version", *dynTags[DT_VERSYM], SHT_GNU_versym, SHF_ALLOC);
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[ndx].sh_size, rdi(shdrs[shdrDynSymNdx].sh_size) / sizeof(Elf_Sym) * sizeof(Elf32_Half));
+        }
+        /* The specs say nothing about this link but linkers set it and readelf
+           seems unhappy without it. */
+        wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        wri(shdrs[ndx].sh_addralign, alignof(Elf32_Half));
+        wri(shdrs[ndx].sh_entsize, sizeof(Elf32_Half));
+    }
+
+    if (dynTags.find(DT_VERDEF) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".gnu.version_d", *dynTags[DT_VERDEF], SHT_GNU_verdef, SHF_ALLOC);
+        if (dynTags.find(DT_VERDEFNUM) != dynTags.end()) {
+            /* An Elf_Verdef may be followed by several ElfVerdaux entries, so
+               we have to parse the whole table to find out its size */
+            auto verDefNum = rdi(dynTags[DT_VERDEFNUM]->d_un.d_val);
+            size_t maxOffset = 0, curOffset = 0;
+            for (size_t i = 0; i < verDefNum; i++) {
+                maxOffset = std::max(maxOffset, curOffset + sizeof(Elf_Verdef));
+                auto verDef = (Elf_Verdef*)(fileContents->data() + rdi(shdrs[ndx].sh_offset) + curOffset);
+                auto auxOffset = curOffset + rdi(verDef->vd_aux);
+                for (size_t i = 0; i < rdi(verDef->vd_cnt); i++) {
+                    maxOffset = std::max(maxOffset, auxOffset + sizeof(Elf_Verdaux));
+                    auto verdAux = (Elf_Verdaux*)(fileContents->data() + rdi(shdrs[ndx].sh_offset) + auxOffset);
+                    auxOffset += rdi(verdAux->vda_next);
+                }
+                curOffset += rdi(verDef->vd_next);
+            }
+            wri(shdrs[ndx].sh_size, maxOffset);
+            /* Not found in specs, linkers set it, readelf needs it. */
+            wri(shdrs[ndx].sh_info, verDefNum);
+        }
+        wri(shdrs[ndx].sh_link, rdi(shdrs[shdrDynamicNdx].sh_link));
+        wri(shdrs[ndx].sh_addralign, std::max(alignof(Elf_Verdef), alignof(Elf_Verdaux)));
+    }
+
+    if (dynTags.find(DT_VERNEED) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".gnu.version_r", *dynTags[DT_VERNEED], SHT_GNU_verneed, SHF_ALLOC);
+        /* Similar to .gnu.version_d, just with different struct names */
+        if (dynTags.find(DT_VERNEEDNUM) != dynTags.end()) {
+            size_t maxOffset = 0, curOffset = 0;
+            auto verNeedNum = rdi(dynTags[DT_VERNEEDNUM]->d_un.d_val);
+            for (size_t i = 0; i < verNeedNum; i++) {
+                maxOffset = std::max(maxOffset, curOffset + sizeof(Elf_Verneed));
+                auto verNeed = (Elf_Verneed*)(fileContents->data() + rdi(shdrs[ndx].sh_offset) + curOffset);
+                auto auxOffset = curOffset + rdi(verNeed->vn_aux);
+                for (size_t i = 0; i < rdi(verNeed->vn_cnt); i++) {
+                    maxOffset = std::max(maxOffset, auxOffset + sizeof(Elf_Vernaux));
+                    auto vernAux = (Elf_Vernaux*)(fileContents->data() + rdi(shdrs[ndx].sh_offset) + auxOffset);
+                    auxOffset += rdi(vernAux->vna_next);
+                }
+                curOffset += rdi(verNeed->vn_next);
+            }
+            wri(shdrs[ndx].sh_size, maxOffset);
+            wri(shdrs[ndx].sh_info, verNeedNum);
+        }
+        wri(shdrs[ndx].sh_link, rdi(shdrs[shdrDynamicNdx].sh_link));
+        wri(shdrs[ndx].sh_addralign, std::max(alignof(Elf_Verneed), alignof(Elf_Vernaux)));
+    }
+
+    if (dynTags.find(DT_INIT) != dynTags.end()) {
+        /* There's no way to find out it's size and alignment. */
+        addSectionHeaderFromDynTag(".init", *dynTags[DT_INIT], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+    }
+
+    if (dynTags.find(DT_FINI) != dynTags.end()) {
+        /* There's no way to find out it's size and alignment. */
+        addSectionHeaderFromDynTag(".fini", *dynTags[DT_FINI], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+    }
+
+    if (dynTags.find(DT_INIT_ARRAY) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".init_array", *dynTags[DT_INIT_ARRAY], SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE);
+        if (dynTags.find(DT_INIT_ARRAYSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_INIT_ARRAYSZ]->d_un.d_val));
+        }
+        wri(shdrs[ndx].sh_addralign, alignof(void(*)()));
+        wri(shdrs[ndx].sh_entsize, sizeof(void(*)()));
+    }
+
+    if (dynTags.find(DT_FINI_ARRAY) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".fini_array", *dynTags[DT_FINI_ARRAY], SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE);
+        if (dynTags.find(DT_FINI_ARRAYSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_FINI_ARRAYSZ]->d_un.d_val));
+        }
+        wri(shdrs[ndx].sh_addralign, alignof(void(*)()));
+        wri(shdrs[ndx].sh_entsize, sizeof(void(*)()));
+    }
+
+    if (dynTags.find(DT_PREINIT_ARRAY) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".preinit_array", *dynTags[DT_PREINIT_ARRAY], SHT_PREINIT_ARRAY, SHF_ALLOC | SHF_WRITE);
+        if (dynTags.find(DT_PREINIT_ARRAYSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_PREINIT_ARRAYSZ]->d_un.d_val));
+        }
+        wri(shdrs[ndx].sh_addralign, alignof(void(*)()));
+        wri(shdrs[ndx].sh_entsize, sizeof(void(*)()));
+    }
+
+    if (dynTags.find(DT_REL) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".rel.dyn", *dynTags[DT_REL], SHT_REL, SHF_ALLOC);
+        if (dynTags.find(DT_RELSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_RELSZ]->d_un.d_val));
+        }
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        }
+        wri(shdrs[ndx].sh_addralign, alignof(Elf_Rel));
+        wri(shdrs[ndx].sh_entsize, sizeof(Elf_Rel));
+        if (dynTags.find(DT_RELENT) != dynTags.end() && rdi(dynTags[DT_RELENT]->d_un.d_val) != sizeof(Elf_Rel)) {
+            error("invalid value of DT_RELENT");
+        }
+    }
+
+    if (dynTags.find(DT_RELA) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".rela.dyn", *dynTags[DT_RELA], SHT_RELA, SHF_ALLOC);
+        if (dynTags.find(DT_RELASZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_RELASZ]->d_un.d_val));
+        }
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        }
+        wri(shdrs[ndx].sh_addralign, alignof(Elf_Rela));
+        wri(shdrs[ndx].sh_entsize, sizeof(Elf_Rela));
+        if (dynTags.find(DT_RELAENT) != dynTags.end() && rdi(dynTags[DT_RELAENT]->d_un.d_val) != sizeof(Elf_Rela)) {
+            error("invalid value of DT_RELAENT");
+        }
+    }
+
+    if (dynTags.find(DT_JMPREL) != dynTags.end() && dynTags.find(DT_PLTREL) != dynTags.end()) {
+        auto relType = rdi(dynTags[DT_PLTREL]->d_un.d_val);
+        size_t ndx = 0;
+        if (relType == DT_REL) {
+            ndx = addSectionHeaderFromDynTag(".rel.plt", *dynTags[DT_JMPREL], SHT_REL, SHF_ALLOC);
+            wri(shdrs[ndx].sh_addralign, alignof(Elf_Rel));
+            wri(shdrs[ndx].sh_entsize, sizeof(Elf_Rel));
+        } else if (relType == DT_RELA) {
+            std::string name = rdi(hdr()->e_machine) == EM_IA_64 ? ".rela.IA_64.pltoff" : ".rela.plt";
+            ndx = addSectionHeaderFromDynTag(name, *dynTags[DT_JMPREL], SHT_RELA, SHF_ALLOC);
+            wri(shdrs[ndx].sh_addralign, alignof(Elf_Rela));
+            wri(shdrs[ndx].sh_entsize, sizeof(Elf_Rela));
+        } else {
+            error("invalid value of DT_PLTREL");
+        }
+        if (dynTags.find(DT_PLTRELSZ) != dynTags.end()) {
+            wri(shdrs[ndx].sh_size, rdi(dynTags[DT_PLTRELSZ]->d_un.d_val));
+        }
+        if (shdrDynSymNdx != SHN_UNDEF) {
+            wri(shdrs[ndx].sh_link, shdrDynSymNdx);
+        }
+    }
+
+    if (dynTags.find(DT_MIPS_RLD_MAP) != dynTags.end()) {
+        auto ndx = addSectionHeaderFromDynTag(".rld_map", *dynTags[DT_MIPS_RLD_MAP], SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+        wri(shdrs[ndx].sh_size, sizeof(uint32_t));
+        wri(shdrs[ndx].sh_addralign, alignof(uint32_t));
+    } else if (dynTags.find(DT_MIPS_RLD_MAP_REL) != dynTags.end()) {
+        Elf_Dyn dynRldMap = {};
+        wri(dynRldMap.d_un.d_ptr, rdi(dynTags[DT_MIPS_RLD_MAP_REL]->d_un.d_val) + rdi(shdrs[shdrDynamicNdx].sh_addr) + ((char*)dynTags[DT_MIPS_RLD_MAP_REL] - (char*)dyns));
+        auto ndx = addSectionHeaderFromDynTag(".rld_map", dynRldMap, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+        wri(shdrs[ndx].sh_size, sizeof(uint32_t));
+        wri(shdrs[ndx].sh_addralign, alignof(uint32_t));
+    }
+
+    /* Set an invalid e_shoff so that the headers will be rewritten by
+       rewriteSections. */
+    wri(hdr()->e_shoff, 0);
+    wri(hdr()->e_shnum, shdrs.size());
+    wri(hdr()->e_shentsize, sizeof(Elf_Shdr));
+    wri(hdr()->e_shstrndx, 1);
+
+    replacedSections[".shstrtab"] = sectionNames;
+
+    sectionsByOldIndex.resize(shdrs.size());
+    for (size_t i = 1; i < shdrs.size(); ++i)
+        sectionsByOldIndex.at(i) = getSectionName(shdrs.at(i));
+
+    /* rewriteSectionsLibrary relies on sorted shdrs to find and replace
+       sections that might be overwritten. */
+    if (!noSort) {
+        sortShdrs();
+    }
+
+    changed = true;
+    this->rewriteSections();
+}
 
 
 static void setSubstr(std::string & s, unsigned int pos, const std::string & t)
@@ -2470,9 +2868,9 @@ static void patchElf()
         const std::string & outputFileName2 = outputFileName.empty() ? fileName : outputFileName;
 
         if (getElfType(fileContents).is32Bit)
-            patchElf2(ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>(fileContents), fileContents, outputFileName2);
+            patchElf2(ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Nhdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>(fileContents), fileContents, outputFileName2);
         else
-            patchElf2(ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>(fileContents), fileContents, outputFileName2);
+            patchElf2(ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf32_Nhdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>(fileContents), fileContents, outputFileName2);
     }
 }
 
@@ -2516,6 +2914,7 @@ static void showHelp(const std::string & progName)
   [--set-execstack]\n\
   [--rename-dynamic-symbols NAME_MAP_FILE]\tRenames dynamic symbols. The map file should contain two symbols (old_name new_name) per line\n\
   [--no-clobber-old-sections]\t\tDo not clobber old section values - only use when the binary expects to find section info at the old location.\n\
+  [--rebuild-section-headers]\t\tTry to rebuild the section header table from segment headers and the dynamic section.\n\
   [--output FILE]\n\
   [--debug]\n\
   [--version]\n\
@@ -2674,6 +3073,9 @@ static int mainWrapped(int argc, char * * argv)
         }
         else if (arg == "--no-clobber-old-sections") {
             clobberOldSections = false;
+        }
+        else if (arg == "--rebuild-section-headers") {
+            rebuildShdrs = true;
         }
         else if (arg == "--help" || arg == "-h" ) {
             showHelp(argv[0]);
